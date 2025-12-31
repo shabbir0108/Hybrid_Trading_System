@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # --- 1. PAGE CONFIGURATION ---
-st.set_page_config(page_title="TradePro AI Terminal", layout="wide", page_icon="📈")
+st.set_page_config(page_title="TradePro Algo Terminal", layout="wide", page_icon="📈")
 
 # --- CUSTOM CSS FOR "PRO" LOOK ---
 st.markdown("""
@@ -93,7 +93,7 @@ class MLEngine:
 
 # --- 3. THE UI (FRONTEND) ---
 st.title("📈 Hybrid Algorithmic Trading System")
-st.markdown("Technical + Sentiment Analysis")
+st.markdown("### Final Year Project | Technical Analysis + Sentiment Engine")
 
 # --- SIDEBAR CONTROL PANEL ---
 st.sidebar.header("⚙️ Configuration")
@@ -117,18 +117,18 @@ if st.sidebar.button("🚀 Analyze Market"):
             df_proc = ml_engine.prepare_data(df)
             
             if not df_proc.empty:
-                ai_signal, acc = ml_engine.train_model(df_proc)
+                algo_signal, acc = ml_engine.train_model(df_proc)
                 
                 # --- HYBRID LOGIC ENGINE ---
-                final_decision = ai_signal
-                reason = "AI and News Agree"
+                final_decision = algo_signal
+                reason = "Technical Model and News Agree"
                 
                 # Conflict Handling
-                if ai_signal == "BUY" and "Bearish" in sent_label:
+                if algo_signal == "BUY" and "Bearish" in sent_label:
                     if risk_tolerance == "Low (Conservative)":
                         final_decision = "HOLD"
                         reason = "News is Negative (Risk Management)"
-                elif ai_signal == "SELL" and "Bullish" in sent_label:
+                elif algo_signal == "SELL" and "Bullish" in sent_label:
                     if risk_tolerance == "Low (Conservative)":
                         final_decision = "HOLD"
                         reason = "News is Positive (Preventing Panic Sell)"
@@ -140,7 +140,7 @@ if st.sidebar.button("🚀 Analyze Market"):
                 
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Live Price", f"${current_price:.2f}", f"{change:.2f}")
-                c2.metric("AI Prediction", ai_signal, f"Accuracy: {acc*100:.0f}%")
+                c2.metric("Algo Prediction", algo_signal, f"Accuracy: {acc*100:.0f}%")
                 c3.metric("Market Sentiment", sent_label, f"Score: {sent_score:.2f}")
                 c4.metric("Final Signal", final_decision, delta_color="off")
 
@@ -184,7 +184,6 @@ if st.sidebar.button("🚀 Analyze Market"):
                     st.dataframe(df_proc.tail(10).style.highlight_max(axis=0))
 
             else:
-                st.error("Not enough data for AI analysis.")
+                st.error("Not enough data for technical analysis.")
         else:
             st.error("Invalid Ticker.")
-
