@@ -202,22 +202,37 @@ if st.sidebar.button("🚀 Execute"):
                     else:
                         st.success(f"✅ **Confirmation:** {reason}")
 
-                    # Charts
-                    st.subheader("📊 Technical Analysis Chart")
-                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
-                    fig.add_trace(go.Candlestick(x=df['Date'], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Price"), row=1, col=1)
-                    if show_indicators:
-                        fig.add_trace(go.Scatter(x=df_proc['Date'], y=df_proc['SMA_50'], line=dict(color='orange', width=1), name="50-Day SMA"), row=1, col=1)
-                    colors = ['red' if row['Open'] - row['Close'] >= 0 else 'green' for index, row in df.iterrows()]
-                    fig.add_trace(go.Bar(x=df['Date'], y=df['Volume'], marker_color=colors, name="Volume"), row=2, col=1)
-                    fig.update_layout(height=600, xaxis_rangeslider_visible=False, template="plotly_dark")
-                    st.plotly_chart(fig, use_container_width=True)
-
-                    # News Tab
+                    # --- RESTORED TABS SECTION ---
                     st.markdown("---")
-                    st.subheader("📰 Live News Feed")
-                    for n in news:
-                        st.markdown(f"> *{n}*")
+                    tab1, tab2, tab3 = st.tabs(["📊 Technical Chart", "📰 Live News", "🔢 Raw Data (Verification)"])
+
+                    with tab1:
+                        st.subheader("Technical Analysis Chart")
+                        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
+                        fig.add_trace(go.Candlestick(x=df['Date'], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Price"), row=1, col=1)
+                        if show_indicators:
+                            fig.add_trace(go.Scatter(x=df_proc['Date'], y=df_proc['SMA_50'], line=dict(color='orange', width=1), name="50-Day SMA"), row=1, col=1)
+                        colors = ['red' if row['Open'] - row['Close'] >= 0 else 'green' for index, row in df.iterrows()]
+                        fig.add_trace(go.Bar(x=df['Date'], y=df['Volume'], marker_color=colors, name="Volume"), row=2, col=1)
+                        fig.update_layout(height=600, xaxis_rangeslider_visible=False, template="plotly_dark")
+                        st.plotly_chart(fig, use_container_width=True)
+
+                    with tab2:
+                        st.subheader("Live Analyst News")
+                        for n in news:
+                            st.markdown(f"> *{n}*")
+
+                    with tab3:
+                        st.subheader("Data Verification Table")
+                        st.write("Below is the real-time data fetched from Yahoo Finance and the indicators calculated by our system.")
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.write("**1. Raw Market Data (From yfinance)**")
+                            st.dataframe(df.tail(10))
+                        with col2:
+                            st.write("**2. Processed Indicators (From 'ta' Lib)**")
+                            st.dataframe(df_proc[['Date', 'Close', 'RSI', 'SMA_50', 'Target']].tail(10))
 
                 # --- MODE 2: TESTING PHASE (BACKTEST) ---
                 else:
