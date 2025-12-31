@@ -1,0 +1,9 @@
+streamlit
+yfinance
+pandas
+requests
+beautifulsoup4
+vaderSentiment
+ta
+scikit-learn
+plotly
