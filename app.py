@@ -93,7 +93,7 @@ class MLEngine:
 
 # --- 3. THE UI (FRONTEND) ---
 st.title("📈 Hybrid Algorithmic Trading System")
-st.markdown("### Final Year Project | Technical Analysis + Sentiment Engine")
+st.markdown("### Technical Analysis + Sentiment Engine")
 
 # --- SIDEBAR CONTROL PANEL ---
 st.sidebar.header("⚙️ Configuration")
@@ -187,3 +187,4 @@ if st.sidebar.button("🚀 Analyze Market"):
                 st.error("Not enough data for technical analysis.")
         else:
             st.error("Invalid Ticker.")
+
