@@ -92,8 +92,8 @@ class MLEngine:
         return ("BUY" if prediction == 1 else "SELL"), acc
 
 # --- 3. THE UI (FRONTEND) ---
-st.title("📈 Hybrid AI Trading System")
-st.markdown("### Final Year Project | AI + Sentiment + Technical Analysis")
+st.title("📈 Hybrid Algorithmic Trading System")
+st.markdown("Technical + Sentiment Analysis")
 
 # --- SIDEBAR CONTROL PANEL ---
 st.sidebar.header("⚙️ Configuration")
@@ -187,3 +187,4 @@ if st.sidebar.button("🚀 Analyze Market"):
                 st.error("Not enough data for AI analysis.")
         else:
             st.error("Invalid Ticker.")
+
