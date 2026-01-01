@@ -258,19 +258,42 @@ elif app_mode == "Comparative Backtesting":
                 lstm_signals = (preds_prob > 0.5).astype(int).flatten()
                 lstm_port, lstm_roi = engine.backtest(df_proc, lstm_signals)
                 
-                # Fix Arrays (Slicing)
-                min_len = min(len(rf_port), len(lstm_port))
-                rf_port = rf_port[-min_len:]
-                lstm_port = lstm_port[-min_len:]
-                dates = df_proc['Date'].values[-min_len:]
+                # --- DATA VERIFICATION & FIX ---
+                st.markdown("---")
+                st.subheader("Data Verification")
                 
-                # Results
-                st.success("Simulation Complete")
-                c1, c2 = st.columns(2)
-                c1.metric("ML (Random Forest) ROI", f"{rf_roi:.2f}%")
-                c2.metric("DL (LSTM) ROI", f"{lstm_roi:.2f}%")
+                len_dates = len(df_proc['Date'])
+                len_rf = len(rf_port)
+                len_lstm = len(lstm_port)
+
+                # Show metrics to ensure transparency
+                dc1, dc2, dc3 = st.columns(3)
+                dc1.metric("Total Dates", len_dates)
+                dc2.metric("RF Points", len_rf)
+                dc3.metric("LSTM Points", len_lstm)
+
+                # DYNAMIC ALIGNMENT: Calculate min common length including Dates!
+                min_len = min(len_rf, len_lstm, len_dates)
                 
-                chart_df = pd.DataFrame({"ML": rf_port, "DL": lstm_port}, index=dates)
-                st.line_chart(chart_df)
+                if min_len > 0:
+                    st.info(f"Aligning visualization to last **{min_len}** common data points.")
+
+                    # Create Safe DataFrame
+                    chart_df = pd.DataFrame({
+                        "Date": df_proc['Date'].values[-min_len:],
+                        "ML (Random Forest)": rf_port[-min_len:],
+                        "DL (LSTM)": lstm_port[-min_len:]
+                    }).set_index("Date")
+                    
+                    # Results
+                    st.success("Simulation Complete")
+                    c1, c2 = st.columns(2)
+                    c1.metric("ML (Random Forest) ROI", f"{rf_roi:.2f}%")
+                    c2.metric("DL (LSTM) ROI", f"{lstm_roi:.2f}%")
+                    
+                    st.line_chart(chart_df)
+                else:
+                    st.error("Error: One of the models failed to generate predictions.")
+
             else:
-                st.error("Error fetching data.")
+                st.error("Error fetching data or insufficient data points.")
