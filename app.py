@@ -28,16 +28,8 @@ st.markdown("""
         text-align: center;
         box-shadow: 0 4px 6px rgba(0,0,0,0.3);
     }
-    /* Green/Red text for signals */
-    .buy-signal { color: #00CC96; font-weight: bold; font-size: 24px; }
-    .sell-signal { color: #EF553B; font-weight: bold; font-size: 24px; }
-    .hold-signal { color: #FFA15A; font-weight: bold; font-size: 24px; }
-    
     /* Headers */
     h1, h2, h3 { font-family: 'Roboto', sans-serif; }
-    
-    /* Divider */
-    hr { margin-top: 10px; margin-bottom: 10px; border: 0; border-top: 1px solid #333; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -198,14 +190,20 @@ if st.sidebar.button("🚀 Initialize System", type="primary"):
                     
                     with col2:
                         st.metric("Algo Accuracy", f"{acc*100:.0f}%")
-                        st.progress(confidence, text=f"AI Confidence: {confidence*100:.0f}%")
+                        # UPDATED: Replaced "AI Confidence" with "Model Confidence"
+                        st.progress(confidence, text=f"Model Confidence: {confidence*100:.0f}%")
                         
                     with col3:
                         st.metric("Sentiment Score", f"{sent_score:.2f}", sent_label)
                         
                     with col4:
-                        color = "green" if final_decision == "BUY" else "red" if final_decision == "SELL" else "orange"
-                        st.markdown(f":{color}-background-co[**{final_decision}**]")
+                        # UPDATED: Fixed the Badge Glitch using HTML
+                        badge_color = "#00CC96" if final_decision == "BUY" else "#EF553B" if final_decision == "SELL" else "#FFA15A"
+                        st.markdown(f"""
+                        <div style="background-color: {badge_color}; padding: 10px; border-radius: 5px; text-align: center;">
+                            <h3 style="color: white; margin:0;">{final_decision}</h3>
+                        </div>
+                        """, unsafe_allow_html=True)
                         st.caption(f"Reason: {reason}")
 
                     # Charts
