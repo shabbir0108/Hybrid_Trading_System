@@ -16,24 +16,15 @@ from plotly.subplots import make_subplots
 # --- 1. PAGE CONFIGURATION ---
 st.set_page_config(page_title="TradePro Algo Terminal", layout="wide", page_icon="📈")
 
-# --- CUSTOM CSS FOR PROFESSIONAL UI ---
+# --- CUSTOM CSS ---
 st.markdown("""
 <style>
-    /* Dark Theme Cards */
-    .metric-card {
-        background-color: #1e1e1e;
-        border: 1px solid #333;
-        padding: 15px;
-        border-radius: 8px;
-        text-align: center;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-    }
-    /* Headers */
+    .metric-card { background-color: #1e1e1e; border: 1px solid #333; padding: 15px; border-radius: 8px; text-align: center; }
     h1, h2, h3 { font-family: 'Roboto', sans-serif; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. BACKEND ENGINE ---
+# --- 2. BACKEND LOGIC ---
 class DataEngine:
     def fetch_market_data(self, ticker, period="2y"):
         try:
@@ -46,13 +37,11 @@ class DataEngine:
         except: return pd.DataFrame()
 
     def get_company_info(self, ticker):
-        """Fetches Company Name & Sector for the UI"""
         try:
             stock = yf.Ticker(ticker)
             info = stock.info
-            return info.get('longName', ticker), info.get('sector', 'Unknown'), info.get('industry', 'Unknown')
-        except:
-            return ticker, "N/A", "N/A"
+            return info.get('longName', ticker), info.get('sector', 'N/A'), info.get('industry', 'N/A')
+        except: return ticker, "N/A", "N/A"
 
     def scrape_analyst_ratings(self, ticker):
         try:
@@ -62,12 +51,7 @@ class DataEngine:
             soup = BeautifulSoup(response.content, 'html.parser')
             news_table = soup.find(id='news-table')
             if not news_table: return "Neutral", 0, []
-            
-            headlines = []
-            for x in news_table.findAll('tr')[:5]:
-                text = x.a.get_text()
-                headlines.append(text)
-
+            headlines = [x.a.get_text() for x in news_table.findAll('tr')[:5]]
             analyzer = SentimentIntensityAnalyzer()
             score = sum([analyzer.polarity_scores(h)['compound'] for h in headlines]) / len(headlines)
             sentiment = "Bullish 🚀" if score > 0.05 else "Bearish 📉" if score < -0.05 else "Neutral 😐"
@@ -90,154 +74,166 @@ class MLEngine:
         split = int(len(df) * 0.8)
         X_train, X_test = X.iloc[:split], X.iloc[split:]
         y_train, y_test = y.iloc[:split], y.iloc[split:]
-        
         model = RandomForestClassifier(n_estimators=100, random_state=42)
         model.fit(X_train, y_train)
-        
         preds = model.predict(X_test)
         acc = accuracy_score(y_test, preds)
-        return model, acc, X_test, y_test
+        return model, acc
 
-    def backtest_strategy(self, df, model):
-        initial_capital = 10000
-        cash = initial_capital
-        position = 0
+    def run_backtest(self, df, model, initial_capital=10000):
+        # Only use the "Test" portion (last 20%) for simulation
         split = int(len(df) * 0.8)
         df_test = df.iloc[split:].copy()
         
         features = df_test[['RSI', 'SMA_50', 'EMA_20', 'Volume']]
-        df_test['Predicted_Signal'] = model.predict(features)
+        df_test['Signal'] = model.predict(features)
         
+        cash = initial_capital
+        position = 0
         portfolio_values = []
+        
         for i, row in df_test.iterrows():
             price = row['Close']
-            signal = row['Predicted_Signal']
-            if signal == 1 and cash > price:
+            if row['Signal'] == 1 and cash > price: # BUY
                 shares = cash // price
                 position += shares
                 cash -= shares * price
-            elif signal == 0 and position > 0:
+            elif row['Signal'] == 0 and position > 0: # SELL
                 cash += position * price
                 position = 0
             portfolio_values.append(cash + (position * price))
             
         df_test['Portfolio_Value'] = portfolio_values
-        final_value = portfolio_values[-1]
-        roi = ((final_value - initial_capital) / initial_capital) * 100
-        return df_test, final_value, roi
+        roi = ((portfolio_values[-1] - initial_capital) / initial_capital) * 100
+        return df_test, portfolio_values[-1], roi
 
-# --- 3. THE UI (FRONTEND) ---
-st.title("📈 Hybrid Algorithmic Trading System")
-
-# Sidebar
-st.sidebar.header("⚙️ Settings")
-ticker = st.sidebar.text_input("Ticker Symbol", "NVDA").upper()
-st.sidebar.caption("Examples: AAPL, GOOGL, TSLA, RELIANCE.NS")
+# --- 3. MAIN APPLICATION UI ---
+st.sidebar.title("🛠️ System Controls")
+app_mode = st.sidebar.selectbox("Select System Mode", ["🔴 Live Trading Dashboard", "🧪 Backtesting Simulator"])
 st.sidebar.markdown("---")
-risk_tolerance = st.sidebar.select_slider("Risk Tolerance", options=["Low (Conservative)", "High (Aggressive)"])
-show_indicators = st.sidebar.toggle("Show Moving Averages", True)
-mode = st.sidebar.radio("System Mode", ["Live Analysis Dashboard", "Testing Phase (Backtest)"])
 
-if st.sidebar.button("🚀 Initialize System", type="primary"):
-    data_engine = DataEngine()
-    ml_engine = MLEngine()
-
-    with st.status("System Status", expanded=True) as status:
-        st.write("📡 Connecting to Market Data Feed...")
-        df = data_engine.fetch_market_data(ticker)
+# ==========================================
+# MODE 1: LIVE TRADING DASHBOARD
+# ==========================================
+if app_mode == "🔴 Live Trading Dashboard":
+    st.title("🔴 Live Algorithmic Trading Dashboard")
+    st.markdown("Real-time Technical & Sentiment Analysis")
+    
+    # Live Settings
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        ticker = st.text_input("Enter Ticker", "NVDA").upper()
+        risk_tolerance = st.selectbox("Risk Tolerance", ["Low (Conservative)", "High (Aggressive)"])
+        run_live = st.button("🚀 Analyze Live Market", type="primary")
+    
+    if run_live:
+        data_engine = DataEngine()
+        ml_engine = MLEngine()
         
-        if not df.empty:
-            st.write(f"🏢 Fetching Profile for {ticker}...")
-            name, sector, industry = data_engine.get_company_info(ticker)
-            
-            st.write("📰 Scraping Analyst Ratings...")
-            sent_label, sent_score, news = data_engine.scrape_analyst_ratings(ticker)
-            
-            st.write("🧠 Training Algorithmic Models...")
-            df_proc = ml_engine.prepare_data(df)
-            
-            if not df_proc.empty:
-                model, acc, X_test, y_test = ml_engine.train_model(df_proc)
-                status.update(label="Analysis Complete!", state="complete", expanded=False)
+        with st.spinner(f"Fetching live data for {ticker}..."):
+            df = data_engine.fetch_market_data(ticker)
+            if not df.empty:
+                name, sector, ind = data_engine.get_company_info(ticker)
+                st.subheader(f"{name} ({ticker})")
+                st.caption(f"Sector: {sector} | Industry: {ind}")
                 
-                # --- COMPANY HEADER ---
-                st.markdown(f"## {name}")
-                st.markdown(f"**Sector:** {sector} | **Industry:** {industry}")
-                st.markdown("---")
-
-                # Live Prediction Logic
-                last_row = df_proc[['RSI', 'SMA_50', 'EMA_20', 'Volume']].iloc[[-1]]
-                prediction = model.predict(last_row)[0]
-                confidence = np.max(model.predict_proba(last_row)) # Confidence score
-                algo_signal = "BUY" if prediction == 1 else "SELL"
-
-                # Hybrid Decision Logic
-                final_decision = algo_signal
-                reason = "Technical & Sentiment Agree"
-                if algo_signal == "BUY" and "Bearish" in sent_label and risk_tolerance.startswith("Low"):
-                    final_decision = "HOLD"
-                    reason = "Negative Sentiment Override"
-                elif algo_signal == "SELL" and "Bullish" in sent_label and risk_tolerance.startswith("Low"):
-                    final_decision = "HOLD"
-                    reason = "Positive Sentiment Override"
-
-                # --- MODE 1: LIVE DASHBOARD ---
-                if mode == "Live Analysis Dashboard":
-                    col1, col2, col3, col4 = st.columns(4)
+                # Fetch Sentiment & Technicals
+                sent_label, sent_score, news = data_engine.scrape_analyst_ratings(ticker)
+                df_proc = ml_engine.prepare_data(df)
+                
+                if not df_proc.empty:
+                    model, acc = ml_engine.train_model(df_proc)
                     
-                    with col1:
-                        st.metric("Current Price", f"${df['Close'].iloc[-1]:.2f}", f"{df['Close'].iloc[-1]-df['Close'].iloc[-2]:.2f}")
+                    # Prediction
+                    last_row = df_proc[['RSI', 'SMA_50', 'EMA_20', 'Volume']].iloc[[-1]]
+                    prediction = model.predict(last_row)[0]
+                    confidence = np.max(model.predict_proba(last_row))
+                    algo_signal = "BUY" if prediction == 1 else "SELL"
                     
-                    with col2:
-                        st.metric("Algo Accuracy", f"{acc*100:.0f}%")
-                        # UPDATED: Replaced "AI Confidence" with "Model Confidence"
-                        st.progress(confidence, text=f"Model Confidence: {confidence*100:.0f}%")
-                        
-                    with col3:
-                        st.metric("Sentiment Score", f"{sent_score:.2f}", sent_label)
-                        
-                    with col4:
-                        # UPDATED: Fixed the Badge Glitch using HTML
-                        badge_color = "#00CC96" if final_decision == "BUY" else "#EF553B" if final_decision == "SELL" else "#FFA15A"
-                        st.markdown(f"""
-                        <div style="background-color: {badge_color}; padding: 10px; border-radius: 5px; text-align: center;">
-                            <h3 style="color: white; margin:0;">{final_decision}</h3>
-                        </div>
-                        """, unsafe_allow_html=True)
-                        st.caption(f"Reason: {reason}")
-
-                    # Charts
-                    st.subheader("📉 Technical Chart")
-                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
+                    # Hybrid Logic
+                    final_decision = algo_signal
+                    reason = "Technical & Sentiment Agree"
+                    if algo_signal == "BUY" and "Bearish" in sent_label and risk_tolerance.startswith("Low"):
+                        final_decision = "HOLD"
+                        reason = "Negative Sentiment Override"
+                    elif algo_signal == "SELL" and "Bullish" in sent_label and risk_tolerance.startswith("Low"):
+                        final_decision = "HOLD"
+                        reason = "Positive Sentiment Override"
+                    
+                    # UI - KPI Cards
+                    k1, k2, k3, k4 = st.columns(4)
+                    k1.metric("Live Price", f"${df['Close'].iloc[-1]:.2f}", f"{df['Close'].iloc[-1]-df['Close'].iloc[-2]:.2f}")
+                    k2.metric("Algo Accuracy", f"{acc*100:.0f}%")
+                    k3.metric("Sentiment", sent_label, f"{sent_score:.2f}")
+                    
+                    badge_color = "#00CC96" if final_decision == "BUY" else "#EF553B" if final_decision == "SELL" else "#FFA15A"
+                    with k4:
+                        st.markdown(f"""<div style="background-color:{badge_color};padding:5px;border-radius:5px;text-align:center;"><h4 style="color:white;margin:0;">{final_decision}</h4></div>""", unsafe_allow_html=True)
+                        st.caption(reason)
+                    
+                    # Chart
+                    st.markdown("### 📉 Technical Chart")
+                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
                     fig.add_trace(go.Candlestick(x=df['Date'], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Price"), row=1, col=1)
-                    if show_indicators:
-                        fig.add_trace(go.Scatter(x=df_proc['Date'], y=df_proc['SMA_50'], line=dict(color='orange', width=1), name="SMA 50"), row=1, col=1)
-                    fig.add_trace(go.Bar(x=df['Date'], y=df['Volume'], name="Volume", marker_color='rgba(100, 200, 255, 0.6)'), row=2, col=1)
-                    fig.update_layout(height=600, template="plotly_dark", xaxis_rangeslider_visible=False)
+                    fig.add_trace(go.Bar(x=df['Date'], y=df['Volume'], name="Volume"), row=2, col=1)
+                    fig.update_layout(height=500, template="plotly_dark", xaxis_rangeslider_visible=False)
                     st.plotly_chart(fig, use_container_width=True)
-
+                    
                     # Tabs
-                    tab1, tab2, tab3 = st.tabs(["📰 Scraped News", "🔢 Data Verification", "📥 Download"])
-                    with tab1:
-                        for n in news: st.info(f"📰 {n}")
-                    with tab2:
-                        st.dataframe(df_proc.tail(10))
-                    with tab3:
-                        csv = df_proc.to_csv().encode('utf-8')
-                        st.download_button("Download Analysis Data (CSV)", csv, "trading_data.csv", "text/csv")
+                    t1, t2, t3 = st.tabs(["📰 Live News", "🔢 Raw Data", "🧠 Model Details"])
+                    with t1:
+                        for n in news: st.info(n)
+                    with t2: st.dataframe(df.tail())
+                    with t3: st.write(f"Model Confidence: {confidence*100:.1f}%")
+                else: st.error("Not enough data.")
+            else: st.error("Invalid Ticker")
 
-                # --- MODE 2: TESTING PHASE ---
-                else:
-                    st.subheader("🧪 Backtesting Simulation")
-                    df_bt, final_val, roi = ml_engine.backtest_strategy(df_proc, model)
+# ==========================================
+# MODE 2: BACKTESTING SIMULATOR
+# ==========================================
+elif app_mode == "🧪 Backtesting Simulator":
+    st.title("🧪 Historical Backtesting Simulator")
+    st.markdown("Test the strategy on past data to verify profitability.")
+    
+    # Backtest Settings (Separate from Live)
+    with st.expander("⚙️ Simulation Settings", expanded=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            bt_ticker = st.text_input("Backtest Ticker", "TSLA").upper()
+            initial_cap = st.number_input("Initial Capital ($)", 1000, 1000000, 10000)
+        with col2:
+            bt_period = st.selectbox("Data Period", ["1y", "2y", "5y", "10y"])
+            run_bt = st.button("▶️ Run Simulation", type="primary")
+            
+    if run_bt:
+        data_engine = DataEngine()
+        ml_engine = MLEngine()
+        
+        with st.spinner(f"Simulating trades for {bt_ticker} over {bt_period}..."):
+            df = data_engine.fetch_market_data(bt_ticker, period=bt_period)
+            if not df.empty:
+                df_proc = ml_engine.prepare_data(df)
+                if not df_proc.empty:
+                    # Train and Simulate
+                    model, acc = ml_engine.train_model(df_proc)
+                    df_res, final_val, roi = ml_engine.run_backtest(df_proc, model, initial_cap)
                     
+                    # Results
+                    st.success("Simulation Complete!")
                     m1, m2, m3 = st.columns(3)
-                    m1.metric("Initial Investment", "$10,000")
-                    m2.metric("Final Portfolio Value", f"${final_val:,.2f}")
-                    m3.metric("Total Return (ROI)", f"{roi:.1f}%", delta=f"{roi:.1f}%")
+                    m1.metric("Start Balance", f"${initial_cap:,.2f}")
+                    m2.metric("Final Balance", f"${final_val:,.2f}")
+                    m3.metric("Total ROI", f"{roi:.2f}%", delta=f"{roi:.2f}%")
                     
-                    st.area_chart(df_bt.set_index("Date")["Portfolio_Value"], color="#00CC96")
-                    st.dataframe(df_bt[['Date', 'Close', 'Predicted_Signal', 'Portfolio_Value']].tail())
-
-            else: st.error("Insufficient Data for Analysis")
-        else: st.error("Ticker Not Found")
+                    # Performance Chart
+                    st.markdown("### 📈 Portfolio Growth")
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=df_res['Date'], y=df_res['Portfolio_Value'], fill='tozeroy', line=dict(color='#00CC96'), name="Portfolio Value"))
+                    fig.update_layout(height=400, template="plotly_dark", title=f"Hypothetical Growth ({bt_ticker})")
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Trade Log
+                    st.markdown("### 📝 Trade Log (Last 10 Days)")
+                    st.dataframe(df_res[['Date', 'Close', 'Signal', 'Portfolio_Value']].tail(10))
+                else: st.error("Insufficient Data")
+            else: st.error("Invalid Ticker")
