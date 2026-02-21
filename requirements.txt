@@ -2,10 +2,12 @@ streamlit
 yfinance
 pandas
 numpy
-requests
 beautifulsoup4
-vaderSentiment
-ta
 plotly
+transformers
+xgboost
 scikit-learn
-tensorflow
+hmmlearn
+ta
+torch
+pytz
