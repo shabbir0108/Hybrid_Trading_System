@@ -6,6 +6,8 @@ import urllib.request
 from bs4 import BeautifulSoup
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import datetime
+import pytz
 
 from transformers import pipeline
 import xgboost as xgb
@@ -60,12 +62,23 @@ def fetch_market_data(ticker):
         st.stop()
 
 def fetch_and_analyze_intraday(ticker):
-    """Engine 2: Fetches and analyzes today's minute-by-minute data."""
+    """Engine 2: Fetches and mathematically analyzes today's minute-by-minute data."""
     try:
         intraday = yf.Ticker(ticker).history(period="1d", interval="1m")
         if intraday.empty:
             return None
             
+        # --- THE FIX: STRICT CALENDAR DATE CHECK ---
+        # Get the exact current date in New York
+        ny_time = datetime.datetime.now(pytz.timezone('US/Eastern'))
+        last_data_date = intraday.index[-1].date()
+        
+        # If the latest data we downloaded is NOT from today's calendar date,
+        # it means the market is closed (weekend/holiday). Return None to hide the chart.
+        if last_data_date != ny_time.date():
+            return None
+
+        # Run Intraday Technical Analysis
         intraday['RSI_1m'] = RSIIndicator(close=intraday['Close'], window=14).rsi()
         macd_1m = MACD(close=intraday['Close'])
         intraday['MACD_1m'] = macd_1m.macd()
@@ -280,7 +293,6 @@ if run_scanner:
                                  marker=dict(symbol='triangle-down', color='#FF0000', size=12, line=dict(color='white', width=1)), 
                                  name='AI Sell Signal'), row=1, col=1)
         
-        # MACD, Signal Line, and Histogram
         macd_hist = processed_data['MACD'][-90:] - processed_data['MACD_Signal'][-90:]
         colors = ['#00FF00' if val >= 0 else '#FF0000' for val in macd_hist]
         fig.add_trace(go.Bar(x=processed_data.index[-90:], y=macd_hist, marker_color=colors, name="MACD Histogram", opacity=0.5), row=2, col=1)
@@ -314,7 +326,6 @@ if run_scanner:
         color = "green" if sentiment['label'] == 'positive' else "red" if sentiment['label'] == 'negative' else "gray"
         st.markdown(f"- **{headline}** ➔ <span style='color:{color}'>[{sentiment['label'].upper()}: {sentiment['score']:.2f}]</span>", unsafe_allow_html=True)
 
-    # --- UPGRADED VERIFICATION ENGINE WITH 3 TABS ---
     st.markdown("---")
     st.subheader("📊 Data Verification Engine")
     tab1, tab2, tab3 = st.tabs(["10-Year Daily Data", "Preprocessed AI Features", "Today's 1-Minute Live Data"])
