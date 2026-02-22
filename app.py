@@ -13,6 +13,7 @@ from transformers import pipeline
 import xgboost as xgb
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score # NEW: VALIDATION METRICS
 from hmmlearn.hmm import GaussianHMM
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
@@ -23,7 +24,7 @@ from ta.volatility import BollingerBands
 # ==========================================
 st.set_page_config(page_title="Institutional Market Scanner", layout="wide", page_icon="📈")
 st.title("⚡ Institutional 24/7 Market Scanner")
-st.markdown("**Architecture:** 10-Year Historical AI + Live 1-Minute Intraday Analysis")
+st.markdown("**Architecture:** 10-Year Historical AI + Live 1-Minute Intraday Analysis + Time-Series Validation")
 
 @st.cache_resource
 def load_finbert():
@@ -35,7 +36,6 @@ finbert = load_finbert()
 # 2. DUAL-TIMEFRAME DATA ENGINES
 # ==========================================
 def fetch_market_data(ticker):
-    """Engine 1: Fetches 10 YEARS of Daily Data for the AI Brain."""
     try:
         stock = yf.Ticker(ticker).history(period="10y")
         vix = yf.Ticker("^VIX").history(period="10y")
@@ -62,23 +62,17 @@ def fetch_market_data(ticker):
         st.stop()
 
 def fetch_and_analyze_intraday(ticker):
-    """Engine 2: Fetches and mathematically analyzes today's minute-by-minute data."""
     try:
         intraday = yf.Ticker(ticker).history(period="1d", interval="1m")
         if intraday.empty:
             return None
             
-        # --- THE FIX: STRICT CALENDAR DATE CHECK ---
-        # Get the exact current date in New York
         ny_time = datetime.datetime.now(pytz.timezone('US/Eastern'))
         last_data_date = intraday.index[-1].date()
         
-        # If the latest data we downloaded is NOT from today's calendar date,
-        # it means the market is closed (weekend/holiday). Return None to hide the chart.
         if last_data_date != ny_time.date():
             return None
 
-        # Run Intraday Technical Analysis
         intraday['RSI_1m'] = RSIIndicator(close=intraday['Close'], window=14).rsi()
         macd_1m = MACD(close=intraday['Close'])
         intraday['MACD_1m'] = macd_1m.macd()
@@ -148,37 +142,50 @@ def fetch_live_sentiment(ticker):
         return ["⚠️ Scraper Blocked"], [{"label": "neutral", "score": 0.0}], 0
 
 # ==========================================
-# 4. AI ENSEMBLE & RISK MODELS
+# 4. AI ENSEMBLE & ACADEMIC VALIDATION
 # ==========================================
 def train_ai_ensemble(df):
     features = ['Frac_Diff_Close', 'RSI', 'MACD', 'VIX']
     X = df[features].values
     y = df['Target'].values
     
+    # --- STRICT TIME-SERIES SPLIT (70% Train, 30% Test) ---
     split_idx = int(len(df) * 0.7)
     X_train, y_train = X[:split_idx], y[:split_idx]
+    X_test, y_test = X[split_idx:], y[split_idx:]
     
+    # Scale Features
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test) # Crucial: Transform test data using Train scaler
     
+    # Train XGBoost
     xgb_model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42)
     xgb_model.fit(X_train_scaled, y_train)
     
+    # --- ACADEMIC VALIDATION SCORING ---
+    y_pred = xgb_model.predict(X_test_scaled)
+    val_metrics = {
+        "Accuracy": accuracy_score(y_test, y_pred),
+        "Precision": precision_score(y_test, y_pred, zero_division=0),
+        "Recall": recall_score(y_test, y_pred, zero_division=0)
+    }
+    
+    # Train Hidden Markov Model (Risk Engine)
     returns = np.diff(np.log(df['Close'].values[:split_idx]), prepend=0).reshape(-1, 1)
     hmm_model = GaussianHMM(n_components=2, covariance_type="full", n_iter=100, random_state=42)
     hmm_model.fit(returns)
-    
     variances = [np.diag(hmm_model.covars_[i]) for i in range(2)]
     crash_state = np.argmax(variances)
     
+    # Train Meta-Learner
     meta_learner = LogisticRegression()
     xgb_train_preds = xgb_model.predict_proba(X_train_scaled)[:, 1]
     simulated_sentiment = np.random.normal(0, 0.5, len(xgb_train_preds))
-    
     meta_X = np.column_stack((xgb_train_preds, simulated_sentiment))
     meta_learner.fit(meta_X, y_train)
     
-    return scaler, xgb_model, hmm_model, crash_state, meta_learner
+    return scaler, xgb_model, hmm_model, crash_state, meta_learner, val_metrics
 
 # ==========================================
 # 5. STREAMLIT FRONTEND & EXECUTION
@@ -196,8 +203,8 @@ if run_scanner:
         intraday_data = fetch_and_analyze_intraday(ticker)
         processed_data = compute_technical_features(raw_data)
         
-    with st.spinner("Training AI on 10-Year Dataset..."):
-        scaler, xgb_model, hmm_model, crash_state, meta_learner = train_ai_ensemble(processed_data)
+    with st.spinner("Training & Validating AI on 10-Year Dataset..."):
+        scaler, xgb_model, hmm_model, crash_state, meta_learner, val_metrics = train_ai_ensemble(processed_data)
         
     with st.spinner("Reading Live Breaking News..."):
         news, sentiment_details, sentiment_score = fetch_live_sentiment(ticker)
@@ -327,8 +334,8 @@ if run_scanner:
         st.markdown(f"- **{headline}** ➔ <span style='color:{color}'>[{sentiment['label'].upper()}: {sentiment['score']:.2f}]</span>", unsafe_allow_html=True)
 
     st.markdown("---")
-    st.subheader("📊 Data Verification Engine")
-    tab1, tab2, tab3 = st.tabs(["10-Year Daily Data", "Preprocessed AI Features", "Today's 1-Minute Live Data"])
+    st.subheader("📊 Data Verification Engine & Academic Validation")
+    tab1, tab2, tab3, tab4 = st.tabs(["10-Year Daily Data", "Preprocessed AI Features", "Today's 1-Minute Live Data", "🛡️ AI Model Validation Metrics"])
     
     with tab1: 
         st.write("Raw Daily OHLCV data fetched for the AI (showing latest 15 days).")
@@ -344,3 +351,14 @@ if run_scanner:
             st.dataframe(intraday_data[['Open', 'High', 'Low', 'Close', 'Volume', 'RSI_1m', 'MACD_1m', 'MACD_Signal_1m']].tail(20), use_container_width=True)
         else:
             st.info("The US Stock Market is currently closed. 1-Minute intraday data will appear here automatically when the market opens.")
+            
+    with tab4:
+        st.write("### 📈 XGBoost Out-of-Sample Performance (30% Test Set)")
+        st.write("These metrics represent how accurately the model predicted market direction on unseen historical data.")
+        
+        col_m1, col_m2, col_m3 = st.columns(3)
+        col_m1.metric("Model Accuracy", f"{val_metrics['Accuracy'] * 100:.1f}%", help="Percentage of total correct predictions (Up or Down).")
+        col_m2.metric("Precision (Bullish)", f"{val_metrics['Precision'] * 100:.1f}%", help="When the AI said the stock would go UP, how often was it right?")
+        col_m3.metric("Recall (Bullish)", f"{val_metrics['Recall'] * 100:.1f}%", help="Out of all actual UP days, how many did the AI successfully catch?")
+        
+        st.caption("*Note: Financial markets are highly stochastic. An accuracy above 52-54% over a 10-year span is considered statistically significant edge for institutional trading.*")
