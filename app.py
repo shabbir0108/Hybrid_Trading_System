@@ -11,9 +11,9 @@ import pytz
 
 from transformers import pipeline
 import xgboost as xgb
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, precision_score, recall_score # NEW: VALIDATION METRICS
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score
+from sklearn.model_selection import TimeSeriesSplit
 from hmmlearn.hmm import GaussianHMM
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
@@ -24,7 +24,7 @@ from ta.volatility import BollingerBands
 # ==========================================
 st.set_page_config(page_title="Institutional Market Scanner", layout="wide", page_icon="📈")
 st.title("⚡ Institutional 24/7 Market Scanner")
-st.markdown("**Architecture:** 10-Year Historical AI + Live 1-Minute Intraday Analysis + Time-Series Validation")
+st.markdown("**Architecture:** Dual-Market Macro-Micro Convergence (US & India) with MPT Allocation & Dynamic Risk Override")
 
 @st.cache_resource
 def load_finbert():
@@ -33,15 +33,17 @@ def load_finbert():
 finbert = load_finbert()
 
 # ==========================================
-# 2. DUAL-TIMEFRAME DATA ENGINES
+# 2. DUAL-MARKET DATA ENGINES
 # ==========================================
-def fetch_market_data(ticker):
+def fetch_macro_data(ticker, market):
     try:
         stock = yf.Ticker(ticker).history(period="10y")
-        vix = yf.Ticker("^VIX").history(period="10y")
+        # ROUTER: Dynamically switch Volatility Index based on geography
+        vix_ticker = "^VIX" if market == "US (Wall Street)" else "^INDIAVIX"
+        vix = yf.Ticker(vix_ticker).history(period="10y")
         
         if stock.empty:
-            st.error(f"❌ ERROR: Yahoo Finance returned no data for {ticker}.")
+            st.error(f"❌ ERROR: Yahoo Finance returned no data for {ticker}. Ensure you use '.NS' or '.BO' for Indian stocks (e.g., RELIANCE.NS).")
             st.stop()
             
         stock.index = pd.to_datetime(stock.index).tz_localize(None).normalize()
@@ -58,31 +60,26 @@ def fetch_market_data(ticker):
         
         return df
     except Exception as e:
-        st.error(f"❌ Data Fetch Error: {str(e)}")
+        st.error(f"❌ Macro Data Fetch Error: {str(e)}")
         st.stop()
 
-def fetch_and_analyze_intraday(ticker):
+def fetch_micro_data(ticker, market):
     try:
-        intraday = yf.Ticker(ticker).history(period="1d", interval="1m")
+        intraday = yf.Ticker(ticker).history(period="7d", interval="1m")
         if intraday.empty:
             return None
             
-        ny_time = datetime.datetime.now(pytz.timezone('US/Eastern'))
-        last_data_date = intraday.index[-1].date()
-        
-        if last_data_date != ny_time.date():
-            return None
-
-        intraday['RSI_1m'] = RSIIndicator(close=intraday['Close'], window=14).rsi()
-        macd_1m = MACD(close=intraday['Close'])
-        intraday['MACD_1m'] = macd_1m.macd()
-        intraday['MACD_Signal_1m'] = macd_1m.macd_signal()
-        
+        # ROUTER: Dynamically anchor VWAP math to local exchange timezone
+        tz = 'US/Eastern' if market == "US (Wall Street)" else 'Asia/Kolkata'
+        intraday.index = pd.to_datetime(intraday.index).tz_convert(tz).tz_localize(None)
         return intraday
     except Exception:
         return None
 
-def compute_technical_features(df):
+# ==========================================
+# 3. PREPROCESSING & FEATURE EXTRACTION
+# ==========================================
+def compute_macro_features(df):
     data = df.copy()
     
     series_vals = data['Close'].values
@@ -92,7 +89,6 @@ def compute_technical_features(df):
     for k in range(1, window):
         weights.append(-weights[-1] * (0.5 - k + 1) / k)
     weights = np.array(weights)[::-1]
-    
     for i in range(window - 1, len(series_vals)):
         res[i] = np.dot(weights, series_vals[i - window + 1 : i + 1])
         
@@ -111,254 +107,390 @@ def compute_technical_features(df):
     
     data['Target'] = (data['Close'].shift(-1) > data['Close']).astype(int)
     data.dropna(inplace=True)
+    return data
+
+def compute_micro_features(df):
+    data = df.copy()
+    data['Date'] = data.index.date
+    data['Typical_Price'] = (data['High'] + data['Low'] + data['Close']) / 3
+    data['VP'] = data['Typical_Price'] * data['Volume']
+    data['Cum_VP'] = data.groupby('Date')['VP'].cumsum()
+    data['Cum_Vol'] = data.groupby('Date')['Volume'].cumsum()
+    data['VWAP'] = data['Cum_VP'] / data['Cum_Vol']
+    data['VWAP_Dist'] = (data['Close'] - data['VWAP']) / data['VWAP']
     
-    if len(data) < 50:
-        st.error(f"❌ ERROR: Not enough data to train.")
-        st.stop()
-        
+    data['Micro_RSI'] = RSIIndicator(close=data['Close'], window=14).rsi()
+    data['Vol_Avg_20'] = data['Volume'].rolling(window=20).mean()
+    data['Vol_Surge'] = data['Volume'] / (data['Vol_Avg_20'] + 1e-9)
+    
+    data['Target'] = (data['Close'].shift(-5) > data['Close']).astype(int)
+    data.dropna(inplace=True)
     return data
 
 # ==========================================
-# 3. LIVE SENTIMENT SCRAPING
+# 4. CONTEXT-AWARE NLP SCRAPER
 # ==========================================
-def fetch_live_sentiment(ticker):
+def fetch_live_sentiment(ticker, market):
     try:
-        url = f"https://finviz.com/quote.ashx?t={ticker}"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0'}
-        req = urllib.request.Request(url, headers=headers)
-        html = urllib.request.urlopen(req, timeout=5).read()
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        news_table = soup.find(id='news-table')
-        if not news_table:
-            return ["No news found."], [{"label": "neutral", "score": 0.0}], 0
+        headlines = []
+        if market == "US (Wall Street)":
+            url = f"https://finviz.com/quote.ashx?t={ticker}"
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            req = urllib.request.Request(url, headers=headers)
+            html = urllib.request.urlopen(req, timeout=5).read()
+            soup = BeautifulSoup(html, 'html.parser')
+            news_table = soup.find(id='news-table')
+            if news_table:
+                headlines = [row.a.text for row in news_table.findAll('tr')][:5] 
+        else:
+            news_data = yf.Ticker(ticker).news
+            if news_data:
+                headlines = [item['title'] for item in news_data][:5]
+                
+        if not headlines:
+            return ["No recent news found."], [{"label": "neutral", "score": 0.0}], 0
             
-        headlines = [row.a.text for row in news_table.findAll('tr')][:5] 
         sentiments = finbert(headlines)
-        
         score = sum([s['score'] if s['label'] == 'positive' else -s['score'] for s in sentiments if s['label'] != 'neutral'])
         return headlines, sentiments, score
     except Exception:
-        return ["⚠️ Scraper Blocked"], [{"label": "neutral", "score": 0.0}], 0
+        return ["⚠️ NLP Scraper Blocked or Failed"], [{"label": "neutral", "score": 0.0}], 0
 
 # ==========================================
-# 4. AI ENSEMBLE & ACADEMIC VALIDATION
+# 5. DUAL-MARKET MPT ENGINE (TRUE RISK MITIGATION)
 # ==========================================
-def train_ai_ensemble(df):
-    features = ['Frac_Diff_Close', 'RSI', 'MACD', 'VIX']
+def calculate_optimal_portfolio(capital, market, risk_profile):
+    if market == "US (Wall Street)":
+        tickers = ['XLK', 'XLV', 'SPY', 'GLD', 'SHY'] 
+        sector_names = ['Tech (XLK)', 'Healthcare (XLV)', 'S&P 500 (SPY)', 'Safe Haven: Gold (GLD)', 'Safe Haven: Bonds (SHY)']
+        risk_free_rate = 0.042 
+    else:
+        tickers = ['NIFTYBEES.NS', 'BANKBEES.NS', 'ITBEES.NS', 'GOLDBEES.NS', 'LIQUIDBEES.NS']
+        sector_names = ['Broad Market (NIFTY)', 'Banking (BANK)', 'IT Sector (IT)', 'Safe Haven: Gold (GOLD)', 'Safe Haven: Cash/Bonds (LIQUID)']
+        risk_free_rate = 0.071 
+        
+    try:
+        data = yf.download(tickers, period="1y", progress=False)['Close']
+        returns = data.pct_change().dropna()
+        
+        recent_returns = returns.tail(90)
+        mean_returns = returns.mean() * 252
+        cov_matrix = recent_returns.cov() * 252 
+        
+        num_portfolios = 5000
+        results = np.zeros((3, num_portfolios))
+        weights_record = []
+        
+        valid_portfolios = 0
+        
+        while valid_portfolios < num_portfolios:
+            weights = np.random.random(len(tickers))
+            weights /= np.sum(weights)
+            
+            # --- THE INSTITUTIONAL FIX ---
+            # Indices 0, 1, 2 are Equities (Risk). Indices 3, 4 are Gold/Bonds (Safety).
+            equity_weights = weights[:3]
+            
+            # Rule 1: No single equity sector can ever exceed 30% of the portfolio.
+            if np.max(equity_weights) > 0.30:
+                continue
+                
+            # Rule 2: If Conservative, strictly limit total equity exposure to 20% combined.
+            # This allows Gold and Bonds to absorb 80-100% of the capital.
+            if risk_profile == "Conservative (Minimum Volatility)" and np.sum(equity_weights) > 0.20:
+                continue
+                
+            weights_record.append(weights)
+            
+            portfolio_return = np.sum(mean_returns * weights)
+            portfolio_std_dev = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+            true_sharpe = (portfolio_return - risk_free_rate) / portfolio_std_dev
+            
+            results[0, valid_portfolios] = portfolio_return
+            results[1, valid_portfolios] = portfolio_std_dev
+            results[2, valid_portfolios] = true_sharpe 
+            
+            valid_portfolios += 1
+            
+        # THE RISK ROUTER
+        if risk_profile == "Conservative (Minimum Volatility)":
+            best_idx = np.argmin(results[1]) # Hunt for absolute lowest mathematical risk
+        else:
+            best_idx = np.argmax(results[2]) # Hunt for highest Sharpe Ratio
+            
+        optimal_weights = weights_record[best_idx]
+        
+        allocation = {tickers[i]: optimal_weights[i] * capital for i in range(len(tickers))}
+        return allocation, optimal_weights, results[0, best_idx], results[1, best_idx], results[2, best_idx], mean_returns, sector_names
+    except Exception as e:
+        st.error(f"❌ MPT Calculation Error: {str(e)}")
+        return None, None, 0, 0, 0, None, None
+
+# ==========================================
+# 6. AI TRAINING ENGINES
+# ==========================================
+def train_macro_ai(df):
+    features = ['Frac_Diff_Close', 'RSI', 'MACD', 'VIX', 'BB_High', 'BB_Low']
     X = df[features].values
     y = df['Target'].values
     
-    # --- STRICT TIME-SERIES SPLIT (70% Train, 30% Test) ---
+    tscv = TimeSeriesSplit(n_splits=5)
+    acc_scores, prec_scores, rec_scores = [], [], []
+    
+    for train_index, test_index in tscv.split(X):
+        X_tr, X_te = X[train_index], X[test_index]
+        y_tr, y_te = y[train_index], y[test_index]
+        
+        scaler_cv = StandardScaler()
+        X_tr_scaled = scaler_cv.fit_transform(X_tr)
+        X_te_scaled = scaler_cv.transform(X_te)
+        
+        xgb_cv = xgb.XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42)
+        xgb_cv.fit(X_tr_scaled, y_tr)
+        
+        preds = xgb_cv.predict(X_te_scaled)
+        acc_scores.append(accuracy_score(y_te, preds))
+        prec_scores.append(precision_score(y_te, preds, zero_division=0))
+        rec_scores.append(recall_score(y_te, preds, zero_division=0))
+        
+    val_metrics = {"Accuracy": np.mean(acc_scores), "Precision": np.mean(prec_scores), "Recall": np.mean(rec_scores)}
+
     split_idx = int(len(df) * 0.7)
     X_train, y_train = X[:split_idx], y[:split_idx]
-    X_test, y_test = X[split_idx:], y[split_idx:]
     
-    # Scale Features
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test) # Crucial: Transform test data using Train scaler
     
-    # Train XGBoost
     xgb_model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42)
     xgb_model.fit(X_train_scaled, y_train)
     
-    # --- ACADEMIC VALIDATION SCORING ---
-    y_pred = xgb_model.predict(X_test_scaled)
-    val_metrics = {
-        "Accuracy": accuracy_score(y_test, y_pred),
-        "Precision": precision_score(y_test, y_pred, zero_division=0),
-        "Recall": recall_score(y_test, y_pred, zero_division=0)
-    }
-    
-    # Train Hidden Markov Model (Risk Engine)
     returns = np.diff(np.log(df['Close'].values[:split_idx]), prepend=0).reshape(-1, 1)
     hmm_model = GaussianHMM(n_components=2, covariance_type="full", n_iter=100, random_state=42)
     hmm_model.fit(returns)
     variances = [np.diag(hmm_model.covars_[i]) for i in range(2)]
     crash_state = np.argmax(variances)
     
-    # Train Meta-Learner
-    meta_learner = LogisticRegression()
-    xgb_train_preds = xgb_model.predict_proba(X_train_scaled)[:, 1]
-    simulated_sentiment = np.random.normal(0, 0.5, len(xgb_train_preds))
-    meta_X = np.column_stack((xgb_train_preds, simulated_sentiment))
-    meta_learner.fit(meta_X, y_train)
+    return scaler, xgb_model, hmm_model, crash_state, val_metrics
+
+def train_micro_sniper(df):
+    features = ['VWAP_Dist', 'Micro_RSI', 'Vol_Surge']
+    X = df[features].values
+    y = df['Target'].values
     
-    return scaler, xgb_model, hmm_model, crash_state, meta_learner, val_metrics
+    scaler = RobustScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    micro_model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.01, max_depth=3, reg_lambda=20, random_state=42)
+    micro_model.fit(X_scaled, y)
+    
+    return scaler, micro_model
 
 # ==========================================
-# 5. STREAMLIT FRONTEND & EXECUTION
+# 7. STREAMLIT UI & MASTER TABS
 # ==========================================
-col1, col2 = st.columns([3, 1])
+master_tab1, master_tab2 = st.tabs(["🎯 Single-Asset AI Scanner", "💼 Institutional Capital Allocation"])
 
-with col2:
-    st.subheader("⚙️ System Controls")
-    ticker = st.text_input("Enter Ticker (e.g., AAPL, NVDA)", "NVDA").upper()
-    run_scanner = st.button("Run Real-Time Scan", type="primary")
+with master_tab1:
+    col1, col2 = st.columns([3, 1])
 
-if run_scanner:
-    with st.spinner("Fetching 10-Year History & 1-Minute Live Data..."):
-        raw_data = fetch_market_data(ticker)
-        intraday_data = fetch_and_analyze_intraday(ticker)
-        processed_data = compute_technical_features(raw_data)
+    with col2:
+        st.subheader("⚙️ System Controls")
+        market_choice = st.radio("Select Exchange:", ["US (Wall Street)", "India (NSE/BSE)"])
         
-    with st.spinner("Training & Validating AI on 10-Year Dataset..."):
-        scaler, xgb_model, hmm_model, crash_state, meta_learner, val_metrics = train_ai_ensemble(processed_data)
+        default_ticker = "NVDA" if market_choice == "US (Wall Street)" else "^BSESN"
+        ticker = st.text_input("Enter Ticker:", default_ticker).upper()
         
-    with st.spinner("Reading Live Breaking News..."):
-        news, sentiment_details, sentiment_score = fetch_live_sentiment(ticker)
-        
-    latest_data = processed_data.iloc[-1]
-    X_live = scaler.transform([latest_data[['Frac_Diff_Close', 'RSI', 'MACD', 'VIX']].values])
-    xgb_prob = xgb_model.predict_proba(X_live)[0][1]
-    
-    meta_X_live = np.column_stack((xgb_prob, sentiment_score))
-    final_prob = meta_learner.predict_proba(meta_X_live)[0][1]
-    
-    recent_returns = np.diff(np.log(raw_data['Close'].values[-10:]), prepend=0).reshape(-1, 1)
-    current_regime = hmm_model.predict(recent_returns)[-1]
-    
-    if current_regime == crash_state:
-        final_signal, signal_color = "🛑 HOLD (HMM Detected Crash Regime)", "red"
-    elif final_prob > 0.55:
-        final_signal, signal_color = "✅ BUY SIGNAL (Ensemble Confirmed)", "green"
-    elif final_prob < 0.45:
-        final_signal, signal_color = "🔻 SELL / SHORT (Ensemble Confirmed)", "orange"
-    else:
-        final_signal, signal_color = "⏸️ NEUTRAL / HOLD", "gray"
-
-    hist_data = processed_data.tail(90)
-    X_hist_scaled = scaler.transform(hist_data[['Frac_Diff_Close', 'RSI', 'MACD', 'VIX']].values)
-    hist_probs = xgb_model.predict_proba(X_hist_scaled)[:, 1]
-    
-    buy_dates, buy_prices, sell_dates, sell_prices = [], [], [], []
-    for i in range(len(hist_probs)):
-        if hist_probs[i] > 0.55:
-            buy_dates.append(hist_data.index[i])
-            buy_prices.append(hist_data['Low'].iloc[i] * 0.98) 
-        elif hist_probs[i] < 0.45:
-            sell_dates.append(hist_data.index[i])
-            sell_prices.append(hist_data['High'].iloc[i] * 1.02) 
-
-    st.markdown("---")
-    st.markdown(f"<h2 style='text-align: center; color: {signal_color};'>{final_signal}</h2>", unsafe_allow_html=True)
-    st.markdown("---")
-    
-    m1, m2, m3, m4 = st.columns(4)
-    current_live_price = intraday_data['Close'].iloc[-1] if intraday_data is not None and not intraday_data.empty else latest_data['Close']
-    
-    m1.metric("Current Live Price", f"${current_live_price:.2f}")
-    m2.metric("XGBoost Probability", f"{xgb_prob * 100:.1f}% Bullish")
-    m3.metric("FinBERT Sentiment", f"{sentiment_score:.2f} Score")
-    m4.metric("HMM Risk Regime", "🚨 CRASH DETECTED" if current_regime == crash_state else "🟢 Stable")
-
-    with col1:
-        if intraday_data is not None and not intraday_data.empty:
-            st.subheader(f"⏱️ Live Intraday Analysis ({ticker} - Today's 1-Minute Action)")
-            is_up = intraday_data['Close'].iloc[-1] >= intraday_data['Open'].iloc[0]
-            line_color = '#00FF00' if is_up else '#FF0000'
+        if market_choice == "India (NSE/BSE)" and not ticker.endswith(".NS") and not ticker.endswith(".BO") and not ticker.startswith("^"):
+            st.warning("⚠️ Indian tickers usually require '.NS' (NSE) or '.BO' (BSE) at the end. Use ^BSESN for Sensex.")
             
-            last_min_rsi = intraday_data['RSI_1m'].iloc[-1]
-            last_min_macd = intraday_data['MACD_1m'].iloc[-1]
-            last_min_sig = intraday_data['MACD_Signal_1m'].iloc[-1]
+        run_scanner = st.button("Run Real-Time Scan", type="primary")
+
+    if run_scanner:
+        with st.spinner(f"Fetching Macro & Micro Datasets for {market_choice}..."):
+            macro_raw = fetch_macro_data(ticker, market_choice)
+            micro_raw = fetch_micro_data(ticker, market_choice)
             
-            intra_rsi_text = "Overbought (High Risk)" if last_min_rsi > 70 else "Oversold (Bounce Potential)" if last_min_rsi < 30 else "Neutral"
-            intra_macd_text = "Bullish Micro-Trend" if last_min_macd > last_min_sig else "Bearish Micro-Trend"
+            macro_processed = compute_macro_features(macro_raw)
+            micro_available = micro_raw is not None and not micro_raw.empty
+            if micro_available:
+                micro_processed = compute_micro_features(micro_raw)
             
-            st.info(f"**Current Minute Analysis:** The 1-minute RSI is {last_min_rsi:.1f} ({intra_rsi_text}). The 1-minute MACD shows a {intra_macd_text}.")
+        with st.spinner("Training Dual-Brain AI Models..."):
+            macro_scaler, macro_xgb, hmm_model, crash_state, macro_metrics = train_macro_ai(macro_processed)
+            if micro_available:
+                micro_scaler, micro_xgb = train_micro_sniper(micro_processed)
             
-            fig_intra = go.Figure()
-            fig_intra.add_trace(go.Scatter(
-                x=intraday_data.index, y=intraday_data['Close'], 
-                mode='lines', line=dict(color=line_color, width=2),
-                fill='tozeroy', fillcolor='rgba(0, 255, 0, 0.1)' if is_up else 'rgba(255, 0, 0, 0.1)', name="Live 1m Price"
-            ))
-            fig_intra.update_layout(height=250, margin=dict(l=0, r=0, t=10, b=0), template="plotly_dark", 
-                                    xaxis_title="Time (Today)", yaxis_title="Price ($)")
-            st.plotly_chart(fig_intra, use_container_width=True)
-            st.markdown("---")
-
-        st.subheader(f"📊 10-Year Macro Trend & Technical Signals ({ticker})")
+        with st.spinner("Executing NLP Sentiment Analysis..."):
+            news, sentiment_details, sentiment_score = fetch_live_sentiment(ticker, market_choice)
+            
+        # --- MACRO INFERENCE ---
+        latest_macro = macro_processed.iloc[-1]
+        X_macro_live = macro_scaler.transform([latest_macro[['Frac_Diff_Close', 'RSI', 'MACD', 'VIX', 'BB_High', 'BB_Low']].values])
+        macro_xgb_prob = macro_xgb.predict_proba(X_macro_live)[0][1]
         
-        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
-                            row_heights=[0.5, 0.25, 0.25], vertical_spacing=0.06,
-                            subplot_titles=("Price Action & AI Decisions", "MACD & Signal Line (Trend Direction)", "RSI (Momentum)"))
+        sentiment_modifier = sentiment_score * 0.075 
+        macro_final_prob = np.clip(macro_xgb_prob + sentiment_modifier, 0, 1.0)
+        macro_bias = "BUY" if macro_final_prob > 0.55 else "SELL" if macro_final_prob < 0.45 else "NEUTRAL"
         
-        fig.add_trace(go.Candlestick(x=raw_data.index[-90:], open=raw_data['Open'][-90:], 
-                                     high=raw_data['High'][-90:], low=raw_data['Low'][-90:], 
-                                     close=raw_data['Close'][-90:], name="Daily Price"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=processed_data.index[-90:], y=processed_data['BB_High'][-90:], 
-                                 line=dict(color='rgba(255,255,255,0.3)', dash='dot'), name="BB High"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=processed_data.index[-90:], y=processed_data['BB_Low'][-90:], 
-                                 line=dict(color='rgba(255,255,255,0.3)', dash='dot'), name="BB Low", fill='tonexty', fillcolor='rgba(255,255,255,0.05)'), row=1, col=1)
+        recent_returns = np.diff(np.log(macro_raw['Close'].values[-10:]), prepend=0).reshape(-1, 1)
+        current_regime = hmm_model.predict(recent_returns)[-1]
         
-        fig.add_trace(go.Scatter(x=buy_dates, y=buy_prices, mode='markers', 
-                                 marker=dict(symbol='triangle-up', color='#00FF00', size=12, line=dict(color='white', width=1)), 
-                                 name='AI Buy Signal'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=sell_dates, y=sell_prices, mode='markers', 
-                                 marker=dict(symbol='triangle-down', color='#FF0000', size=12, line=dict(color='white', width=1)), 
-                                 name='AI Sell Signal'), row=1, col=1)
+        # --- MICRO INFERENCE ---
+        micro_prob = 0.5
+        micro_bias = "NEUTRAL"
+        SLIPPAGE_BARRIER = 0.60 
         
-        macd_hist = processed_data['MACD'][-90:] - processed_data['MACD_Signal'][-90:]
-        colors = ['#00FF00' if val >= 0 else '#FF0000' for val in macd_hist]
-        fig.add_trace(go.Bar(x=processed_data.index[-90:], y=macd_hist, marker_color=colors, name="MACD Histogram", opacity=0.5), row=2, col=1)
-        fig.add_trace(go.Scatter(x=processed_data.index[-90:], y=processed_data['MACD'][-90:], name="MACD Line", line=dict(color='#00F1FF', width=2)), row=2, col=1)
-        fig.add_trace(go.Scatter(x=processed_data.index[-90:], y=processed_data['MACD_Signal'][-90:], name="Signal Line", line=dict(color='#FFB300', width=2)), row=2, col=1)
-        
-        bull_cross_idx = processed_data.index[-90:][processed_data['MACD_Bullish_Cross'][-90:]]
-        bull_cross_val = processed_data['MACD'][-90:][processed_data['MACD_Bullish_Cross'][-90:]]
-        bear_cross_idx = processed_data.index[-90:][processed_data['MACD_Bearish_Cross'][-90:]]
-        bear_cross_val = processed_data['MACD'][-90:][processed_data['MACD_Bearish_Cross'][-90:]]
-        
-        fig.add_trace(go.Scatter(x=bull_cross_idx, y=bull_cross_val, mode='markers', 
-                                 marker=dict(color='#00FF00', size=10, symbol='circle', line=dict(color='white', width=1)), 
-                                 name="MACD Bull Cross"), row=2, col=1)
-        fig.add_trace(go.Scatter(x=bear_cross_idx, y=bear_cross_val, mode='markers', 
-                                 marker=dict(color='#FF0000', size=10, symbol='circle', line=dict(color='white', width=1)), 
-                                 name="MACD Bear Cross"), row=2, col=1)
-
-        fig.add_trace(go.Scatter(x=processed_data.index[-90:], y=processed_data['RSI'][-90:], name="RSI", line=dict(color='#E040FB', width=2)), row=3, col=1)
-        fig.add_hline(y=70, line_dash="dash", line_color="#FF0000", row=3, col=1, annotation_text="Overbought (70)")
-        fig.add_hline(y=30, line_dash="dash", line_color="#00FF00", row=3, col=1, annotation_text="Oversold (30)")
-        
-        fig.update_layout(height=800, margin=dict(l=10, r=10, t=40, b=10), template="plotly_dark", 
-                          legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-        
-        fig.update_xaxes(showgrid=True, gridcolor='rgba(255,255,255,0.05)', rangeslider_visible=False) 
-        st.plotly_chart(fig, use_container_width=True)
-
-    st.subheader("🧠 Live FinBERT Sentiment Analysis")
-    for headline, sentiment in zip(news, sentiment_details):
-        color = "green" if sentiment['label'] == 'positive' else "red" if sentiment['label'] == 'negative' else "gray"
-        st.markdown(f"- **{headline}** ➔ <span style='color:{color}'>[{sentiment['label'].upper()}: {sentiment['score']:.2f}]</span>", unsafe_allow_html=True)
-
-    st.markdown("---")
-    st.subheader("📊 Data Verification Engine & Academic Validation")
-    tab1, tab2, tab3, tab4 = st.tabs(["10-Year Daily Data", "Preprocessed AI Features", "Today's 1-Minute Live Data", "🛡️ AI Model Validation Metrics"])
-    
-    with tab1: 
-        st.write("Raw Daily OHLCV data fetched for the AI (showing latest 15 days).")
-        st.dataframe(raw_data.tail(15), use_container_width=True)
-    
-    with tab2: 
-        st.write("Engineered features calculated for the XGBoost model (showing latest 15 days).")
-        st.dataframe(processed_data[['Close', 'Frac_Diff_Close', 'RSI', 'MACD', 'VIX', 'Target']].tail(15), use_container_width=True)
-        
-    with tab3:
-        if intraday_data is not None and not intraday_data.empty:
-            st.write(f"Live 1-Minute data points dynamically tracked today ({len(intraday_data)} total minutes recorded so far).")
-            st.dataframe(intraday_data[['Open', 'High', 'Low', 'Close', 'Volume', 'RSI_1m', 'MACD_1m', 'MACD_Signal_1m']].tail(20), use_container_width=True)
+        if micro_available:
+            latest_micro = micro_processed.iloc[-1]
+            X_micro_live = micro_scaler.transform([latest_micro[['VWAP_Dist', 'Micro_RSI', 'Vol_Surge']].values])
+            micro_prob = micro_xgb.predict_proba(X_micro_live)[0][1]
+            micro_bias = "BUY" if micro_prob >= SLIPPAGE_BARRIER else "SELL" if micro_prob <= (1 - SLIPPAGE_BARRIER) else "NEUTRAL"
+            
+        # --- THE BOOLEAN CONVERGENCE GATE ---
+        if current_regime == crash_state:
+            final_signal, signal_color = "🛑 HOLD (HMM CRASH REGIME DETECTED)", "red"
+        elif macro_bias == "BUY" and micro_bias == "BUY":
+            final_signal, signal_color = "✅ EXECUTE BUY NOW (Golden Entry)", "green"
+        elif macro_bias == "BUY" and micro_bias == "SELL":
+            final_signal, signal_color = "⏸️ HOLD (Waiting for Micro-Support)", "orange"
+        elif macro_bias == "SELL" and micro_bias == "BUY":
+            final_signal, signal_color = "🔻 EXECUTE SHORT (Fade the Fake Rally)", "purple"
+        elif macro_bias == "SELL" and micro_bias == "SELL":
+            final_signal, signal_color = "🛑 DO NOT TOUCH (Macro & Micro Bleed)", "red"
         else:
-            st.info("The US Stock Market is currently closed. 1-Minute intraday data will appear here automatically when the market opens.")
+            final_signal, signal_color = "⏸️ NEUTRAL / HOLD", "gray"
+
+        # UI Rendering
+        st.markdown("---")
+        st.markdown(f"<h2 style='text-align: center; color: {signal_color};'>{final_signal}</h2>", unsafe_allow_html=True)
+        st.markdown("---")
+        
+        m1, m2, m3, m4 = st.columns(4)
+        current_live_price = micro_raw['Close'].iloc[-1] if micro_available else latest_macro['Close']
+        currency = "$" if market_choice == "US (Wall Street)" else "₹"
+        
+        m1.metric("Current Live Price", f"{currency}{current_live_price:.2f}")
+        m2.metric("Macro Trend Bias", f"{macro_bias} ({macro_final_prob * 100:.1f}%)")
+        m3.metric("Micro Sniper Bias", f"{micro_bias} ({micro_prob * 100:.1f}%)" if micro_available else "Market Closed")
+        m4.metric("HMM Risk Engine", "🚨 CRASH DETECTED" if current_regime == crash_state else "🟢 Stable")
+
+        with col1:
+            if micro_available:
+                st.subheader(f"⏱️ Live 1-Minute Microstructure & VWAP ({ticker})")
+                is_up = micro_raw['Close'].iloc[-1] >= micro_raw['Open'].iloc[0]
+                line_color = '#00FF00' if is_up else '#FF0000'
+                
+                fig_intra = go.Figure()
+                plot_data = micro_processed.tail(60)
+                
+                fig_intra.add_trace(go.Scatter(x=plot_data.index, y=plot_data['Close'], mode='lines', line=dict(color=line_color, width=2), name="Live Price"))
+                fig_intra.add_trace(go.Scatter(x=plot_data.index, y=plot_data['VWAP'], mode='lines', line=dict(color='#E040FB', width=2, dash='dot'), name="VWAP"))
+                fig_intra.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), template="plotly_dark")
+                st.plotly_chart(fig_intra, use_container_width=True)
+                st.markdown("---")
+
+            st.subheader(f"📊 10-Year Macro Trend & Technical Signals ({ticker})")
             
-    with tab4:
-        st.write("### 📈 XGBoost Out-of-Sample Performance (30% Test Set)")
-        st.write("These metrics represent how accurately the model predicted market direction on unseen historical data.")
+            hist_data = macro_processed.tail(90)
+            X_hist_scaled = macro_scaler.transform(hist_data[['Frac_Diff_Close', 'RSI', 'MACD', 'VIX', 'BB_High', 'BB_Low']].values)
+            hist_probs = macro_xgb.predict_proba(X_hist_scaled)[:, 1]
+            
+            buy_dates, buy_prices, sell_dates, sell_prices = [], [], [], []
+            for i in range(len(hist_probs)):
+                if hist_probs[i] > 0.55:
+                    buy_dates.append(hist_data.index[i])
+                    buy_prices.append(hist_data['Low'].iloc[i] * 0.98) 
+                elif hist_probs[i] < 0.45:
+                    sell_dates.append(hist_data.index[i])
+                    sell_prices.append(hist_data['High'].iloc[i] * 1.02) 
+                    
+            fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.5, 0.25, 0.25], vertical_spacing=0.06, subplot_titles=("Price Action & AI Decisions", "MACD Trend", "RSI Momentum"))
+            fig.add_trace(go.Candlestick(x=macro_raw.index[-90:], open=macro_raw['Open'][-90:], high=macro_raw['High'][-90:], low=macro_raw['Low'][-90:], close=macro_raw['Close'][-90:], name="Daily Price"), row=1, col=1)
+            fig.add_trace(go.Scatter(x=macro_processed.index[-90:], y=macro_processed['BB_High'][-90:], line=dict(color='rgba(255,255,255,0.3)', dash='dot'), name="BB High"), row=1, col=1)
+            fig.add_trace(go.Scatter(x=macro_processed.index[-90:], y=macro_processed['BB_Low'][-90:], line=dict(color='rgba(255,255,255,0.3)', dash='dot'), name="BB Low", fill='tonexty', fillcolor='rgba(255,255,255,0.05)'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=buy_dates, y=buy_prices, mode='markers', marker=dict(symbol='triangle-up', color='#00FF00', size=14, line=dict(color='white', width=1)), name='AI Buy Signal'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=sell_dates, y=sell_prices, mode='markers', marker=dict(symbol='triangle-down', color='#FF0000', size=14, line=dict(color='white', width=1)), name='AI Sell Signal'), row=1, col=1)
+            
+            macd_hist = macro_processed['MACD'][-90:] - macro_processed['MACD_Signal'][-90:]
+            colors = ['#00FF00' if val >= 0 else '#FF0000' for val in macd_hist]
+            fig.add_trace(go.Bar(x=macro_processed.index[-90:], y=macd_hist, marker_color=colors, name="MACD Hist"), row=2, col=1)
+            fig.add_trace(go.Scatter(x=macro_processed.index[-90:], y=macro_processed['MACD'][-90:], line=dict(color='#00F1FF'), name="MACD"), row=2, col=1)
+            fig.add_trace(go.Scatter(x=macro_processed.index[-90:], y=macro_processed['MACD_Signal'][-90:], line=dict(color='#FFB300'), name="Signal"), row=2, col=1)
+            fig.add_trace(go.Scatter(x=macro_processed.index[-90:], y=macro_processed['RSI'][-90:], line=dict(color='#E040FB'), name="RSI"), row=3, col=1)
+            fig.add_hline(y=70, line_dash="dash", line_color="#FF0000", row=3, col=1)
+            fig.add_hline(y=30, line_dash="dash", line_color="#00FF00", row=3, col=1)
+            
+            fig.update_layout(height=800, margin=dict(l=10, r=10, t=40, b=10), template="plotly_dark", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+            fig.update_xaxes(showgrid=True, gridcolor='rgba(255,255,255,0.05)', rangeslider_visible=False) 
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("🧠 Live FinBERT Sentiment Analysis")
+        for headline, sentiment in zip(news, sentiment_details):
+            color = "green" if sentiment['label'] == 'positive' else "red" if sentiment['label'] == 'negative' else "gray"
+            st.markdown(f"- **{headline}** ➔ <span style='color:{color}'>[{sentiment['label'].upper()}: {sentiment['score']:.2f}]</span>", unsafe_allow_html=True)
+
+        st.markdown("---")
+        st.subheader("📊 Data Verification Engine & Academic Validation")
+        tab1, tab2, tab3 = st.tabs(["🛡️ Macro WFO Metrics", "Macro Features (10y)", "Micro Features (7d)"])
+        with tab1:
+            st.write("### 📈 Walk-Forward Optimization (Time-Series Out-of-Sample Validation)")
+            col_m1, col_m2, col_m3 = st.columns(3)
+            col_m1.metric("WFO Average Accuracy", f"{macro_metrics['Accuracy'] * 100:.1f}%")
+            col_m2.metric("WFO Average Precision", f"{macro_metrics['Precision'] * 100:.1f}%")
+            col_m3.metric("WFO Average Recall", f"{macro_metrics['Recall'] * 100:.1f}%")
+        with tab2: 
+            st.dataframe(macro_processed[['Close', 'Frac_Diff_Close', 'RSI', 'MACD', 'BB_High', 'BB_Low', 'Target']].tail(15), use_container_width=True)
+        with tab3:
+            if micro_available:
+                st.dataframe(micro_processed[['Close', 'VWAP', 'VWAP_Dist', 'Micro_RSI', 'Vol_Surge', 'Target']].tail(15), use_container_width=True)
+            else:
+                st.info("Market Closed - No minute data available.")
+
+with master_tab2:
+    st.subheader("💼 Institutional Capital Management & Risk Allocation")
+    
+    col_opt1, col_opt2, col_opt3 = st.columns(3)
+    with col_opt1:
+        mpt_market = st.radio("Select Market:", ["US (Wall Street)", "India (NSE/BSE)"])
+    with col_opt2:
+        risk_profile = st.selectbox("Select Risk Profile:", ["Balanced (Max Sharpe)", "Conservative (Minimum Volatility)"])
+    with col_opt3:
+        capital_input = st.number_input("Enter Total Investment Capital:", min_value=1000, value=10000, step=1000)
         
-        col_m1, col_m2, col_m3 = st.columns(3)
-        col_m1.metric("Model Accuracy", f"{val_metrics['Accuracy'] * 100:.1f}%", help="Percentage of total correct predictions (Up or Down).")
-        col_m2.metric("Precision (Bullish)", f"{val_metrics['Precision'] * 100:.1f}%", help="When the AI said the stock would go UP, how often was it right?")
-        col_m3.metric("Recall (Bullish)", f"{val_metrics['Recall'] * 100:.1f}%", help="Out of all actual UP days, how many did the AI successfully catch?")
-        
-        st.caption("*Note: Financial markets are highly stochastic. An accuracy above 52-54% over a 10-year span is considered statistically significant edge for institutional trading.*")
+    run_mpt = st.button("Calculate Optimal Allocation", type="primary")
+    
+    if run_mpt:
+        with st.spinner(f"Simulating 5,000 Portfolio Combinations for {mpt_market}..."):
+            allocation, weights, exp_return, exp_volatility, sharpe, mean_returns, sector_names = calculate_optimal_portfolio(capital_input, mpt_market, risk_profile)
+            
+            if allocation:
+                st.markdown("---")
+                a1, a2, a3 = st.columns(3)
+                a1.metric("Expected Annual Return", f"{exp_return * 100:.2f}%")
+                a2.metric("Expected Annual Risk (Volatility)", f"{exp_volatility * 100:.2f}%")
+                
+                if risk_profile == "Balanced (Max Sharpe)":
+                    a3.metric("True Sharpe Ratio", f"{sharpe:.2f}", help="Return generated per unit of risk above the Risk-Free Rate.")
+                else:
+                    a3.metric("Optimization Focus", "Minimum Volatility")
+                
+                st.markdown("---")
+                c1, c2 = st.columns([1, 1.2])
+                currency = "$" if mpt_market == "US (Wall Street)" else "₹"
+                
+                with c1:
+                    for i, (ticker, amount) in enumerate(allocation.items()):
+                        st.success(f"**{sector_names[i]}:** {currency}{amount:.2f} ➔ **({weights[i]*100:.1f}%)**")
+                        
+                with c2:
+                    fig_pie = go.Figure(data=[go.Pie(labels=sector_names, values=weights, hole=.4, marker=dict(colors=['#00F1FF', '#E040FB', '#FFB300', '#00FF00', '#FF0000']))])
+                    fig_pie.update_layout(template="plotly_dark", margin=dict(t=0, b=0, l=0, r=0), height=300)
+                    st.plotly_chart(fig_pie, use_container_width=True)
+                
+                st.markdown("---")
+                max_weight_idx = np.argmax(weights)
+                
+                if risk_profile == "Conservative (Minimum Volatility)":
+                    st.info(f"**Risk Override Engaged:** The algorithm bypassed the Max Sharpe calculation and strictly targeted the **Global Minimum Volatility (GMV)** portfolio. Heaviest weighting went to **{sector_names[max_weight_idx]}** to violently suppress covariance and protect principal capital, sacrificing upside yield for maximum stability.")
+                else:
+                    st.info(f"**Primary Growth Driver:** Heaviest allocation (**{weights[max_weight_idx]*100:.1f}%**) went to **{sector_names[max_weight_idx]}** due to its superior 90-day momentum, maximizing the risk-to-reward ratio.")
